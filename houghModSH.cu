@@ -152,43 +152,49 @@ void CPU_HoughTran (unsigned char *pic, int w, int h, int **acc)
           }
       }
 }
-
-//*****************************************************************
-// TODO usar memoria constante para la tabla de senos y cosenos
-// inicializarlo en main y pasarlo al device
-//__constant__ float d_Cos[degreeBins];
-//__constant__ float d_Sin[degreeBins];
-
-//*****************************************************************
-//TODO Kernel memoria compartida
-// __global__ void GPU_HoughTranShared(...)
-// {
-//   //TODO
-// }
 __constant__ float d_Cos[degreeBins];
 __constant__ float d_Sin[degreeBins];
-__global__ void GPU_HoughTran (unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
-{
-  // Calculate global ID
-  int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void GPU_HoughTran_SharedMemory(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale) {
+    // Calculate global ID and local ID
+    int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+    int locID = threadIdx.x;
 
-  if (gloID >= w * h) return; // Check if gloID is within the bounds of the image size
+    // Define the shared memory accumulator
+    __shared__ int localAcc[degreeBins * rBins];
 
-  int xCent = w / 2;
-  int yCent = h / 2;
-  int xCoord = gloID % w - xCent;
-  int yCoord = yCent - gloID / w;
-
-  if (pic[gloID] > 0)
-  {
-    for (int tIdx = 0; tIdx < degreeBins; tIdx++)
-    {
-      float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
-      int rIdx = (r + rMax) / rScale;
-      atomicAdd (acc + (rIdx * degreeBins + tIdx), 1);
+    // Initialize the shared memory to zero
+    for (int i = locID; i < degreeBins * rBins; i += blockDim.x) {
+        localAcc[i] = 0;
     }
-  }
+
+    // Synchronize threads in the block
+    __syncthreads();
+
+    // Check if gloID is within the bounds of the image size
+    if (gloID < w * h) {
+        int xCent = w / 2;
+        int yCent = h / 2;
+        int xCoord = gloID % w - xCent;
+        int yCoord = yCent - gloID / w;
+
+        if (pic[gloID] > 0) {
+            for (int tIdx = 0; tIdx < degreeBins; tIdx++) {
+                float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
+                int rIdx = (r + rMax) / rScale;
+                atomicAdd(&localAcc[rIdx * degreeBins + tIdx], 1);
+            }
+        }
+    }
+
+    // Synchronize threads in the block again
+    __syncthreads();
+
+    // Aggregate the results from shared memory to global memory
+    for (int i = locID; i < degreeBins * rBins; i += blockDim.x) {
+        atomicAdd(&acc[i], localAcc[i]);
+    }
 }
+
 
 
 int main (int argc, char **argv)
@@ -258,7 +264,8 @@ int main (int argc, char **argv)
   int blockNum = ceil (w * h / 256);
   
   //GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale, d_Cos, d_Sin);
-  GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
+  // GPU_HoughTran <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
+  GPU_HoughTran_SharedMemory <<< blockNum, 256 >>> (d_in, w, h, d_hough, rMax, rScale);
 
 
   // get results from device
@@ -295,7 +302,7 @@ printf("Drawing lines...\n");
 
   //inImg.write("modified_image.pgm");
   cv::Mat imageMat(inImg.y_dim, inImg.x_dim, CV_8UC1, inImg.pixels);
-  cv::imwrite("outputConst.png", imageMat);
+  cv::imwrite("outputShared.png", imageMat);
 
   // compare CPU and GPU results
   // for (i = 0; i < degreeBins * rBins; i++)
